@@ -24,12 +24,18 @@ final class Database
         $db->exec('BEGIN IMMEDIATE');
         try {
             $db->exec('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
-            if ($db->query("SELECT value FROM metadata WHERE key = 'schema_version'")->fetchColumn()) {
-                $db->exec('COMMIT');
-                return;
+            $version = (int) $db->query("SELECT value FROM metadata WHERE key = 'schema_version'")->fetchColumn();
+            if ($version === 0) {
+                $db->exec(file_get_contents(__DIR__ . '/../schema.sql'));
+                self::seed($db);
+                $version = 1;
             }
-            $db->exec(file_get_contents(__DIR__ . '/../schema.sql'));
-            self::seed($db);
+            if ($version === 1) {
+                $db->exec(file_get_contents(__DIR__ . '/../migrations/002_comment_requests.sql'));
+                $db->exec("UPDATE metadata SET value='2' WHERE key='schema_version'");
+                $version = 2;
+            }
+            if ($version !== 2) throw new RuntimeException('Unsupported database schema version');
             $db->exec('COMMIT');
         } catch (Throwable $error) {
             $db->exec('ROLLBACK');

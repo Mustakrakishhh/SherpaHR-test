@@ -9,18 +9,92 @@
 </header>
 <div class="shell">
   <nav class="sidebar" aria-label="Проекты">
+    <button class="project-link overview-link" [class.selected]="view() === 'overview'" [attr.aria-current]="view() === 'overview' ? 'page' : null" (click)="showOverview()" [disabled]="!context()">
+      <span class="project-icon">◉</span><span>Требуют внимания<small>Обзор моих проектов</small></span>
+      @if (overview()) { <span class="nav-count">{{attentionTasks().length}}</span> }
+    </button>
     <div class="nav-heading">Ваши проекты <span>{{projects().length}}</span></div>
     @for (p of projects(); track p.id) {
-      <button class="project-link" [class.selected]="project()?.id === p.id" [attr.aria-current]="project()?.id === p.id ? 'page' : null" (click)="selectProject(p)">
+      <button class="project-link" [class.selected]="view() === 'project' && project()?.id === p.id" [attr.aria-current]="view() === 'project' && project()?.id === p.id ? 'page' : null" (click)="selectProject(p)">
         <span class="project-icon">{{p.archived ? '▤' : '▧'}}</span><span>{{p.name}}<small>{{p.archived ? 'Архив' : p.task_count + ' задач'}}</small></span>
       </button>
     }
     <div class="sidebar-note">Задачи, договорённости<br>и история команды.</div>
   </nav>
   <main>
-    @if (error()) { <div role="alert" class="alert error">{{error()}}</div> }
-    @if (notice()) { <div role="status" class="alert success">{{notice()}}</div> }
-    @if (project(); as p) {
+    @if (error() && !detail() && !creating() && !detailLoading()) { <div role="alert" class="alert error">{{error()}}</div> }
+    @if (notice() && !detail() && !creating() && !detailLoading()) { <div role="status" class="alert success">{{notice()}}</div> }
+    @if (!context() && loading()) { <div class="empty" role="status">Загружаем проекты…</div> }
+    @else if (!context()) { <button (click)="load()">Повторить загрузку</button> }
+    @else if (view() === 'overview') {
+      <div class="breadcrumb">Рабочее пространство <span>/</span> Обзор руководителя</div>
+      <div class="page-heading"><div><h1>Требуют внимания</h1><p>Что мешает работе в проектах, которыми вы руководите.</p></div>
+        <button (click)="refreshOverview()" [disabled]="overviewLoading()">{{overviewLoading() ? 'Обновляем…' : 'Обновить обзор'}}</button>
+      </div>
+      <div class="overview-meta"><span>Активных проектов: {{ownedProjects().length}}</span>
+        @if (overview(); as data) { <span>Обновлено {{data.generated_at | date:'dd.MM.yyyy HH:mm:ss':'UTC'}} UTC</span> }
+      </div>
+      @if (overviewError()) { <div role="alert" class="alert error">Обзор не обновлён: {{overviewError()}}. Повторите обновление; показанные данные могут быть устаревшими.</div> }
+      <div class="attention-summary" aria-label="Причины внимания">
+        @for (r of reasons; track r.value) {
+          <button [class.active]="reason() === r.value" [attr.aria-pressed]="reason() === r.value" (click)="reason.set(reason() === r.value ? '' : r.value)">
+            <strong>{{reasonCount(r.value)}}</strong><span>{{r.label}}</span>
+          </button>
+        }
+      </div>
+      <section class="task-section" aria-label="Общий обзор задач" [attr.aria-busy]="overviewLoading()">
+        <div class="toolbar overview-toolbar">
+          <div class="scope-switch" role="group" aria-label="Объём обзора">
+            <button [class.active]="scope() === 'attention'" [attr.aria-pressed]="scope() === 'attention'" (click)="setScope('attention')">Требуют внимания <span>{{attentionTasks().length}}</span></button>
+            <button [class.active]="scope() === 'all'" [attr.aria-pressed]="scope() === 'all'" (click)="setScope('all')">Все незавершённые <span>{{overview()?.tasks?.length ?? 0}}</span></button>
+          </div>
+          <input aria-label="Поиск в обзоре" placeholder="Задача, проект, комментарий…" [ngModel]="attentionSearch()" (ngModelChange)="attentionSearch.set($event)">
+        </div>
+        <p class="overview-explanation">Блокировки, просрочки, задачи без исполнителя и необработанные просьбы о помощи. Явные обращения отмечают участники; поиск по ключевым фразам даёт дополнительные подсказки. В режиме «Все незавершённые» доступны и остальные обсуждения.</p>
+        @if (reason()) { <div class="applied-filter">Причина: {{reasonLabel($any(reason()))}} <button (click)="reason.set('')">Сбросить причину</button></div> }
+        @if (overviewLoading() && !overview()) { <div class="empty" role="status">Собираем задачи ваших проектов…</div> }
+        @else if (!overview() && overviewError()) { <div class="empty">Не удалось загрузить задачи. Нажмите «Обновить обзор».</div> }
+        @else if (!ownedProjects().length) { <div class="empty">У вас нет активных проектов, которыми вы руководите. Доступные вам проекты можно открыть в меню.</div> }
+        @else {
+          <div class="attention-list">
+            @for (task of visibleAttentionTasks(); track task.id) {
+              <article class="attention-card" [class.current]="detail()?.id === task.id">
+                <div class="attention-project">{{task.project_name}} <span>· #{{task.id}}</span></div>
+                <div class="attention-title-row"><button class="attention-title" (click)="openTask(task)">{{task.title}}</button><span class="badge" [class]="'badge ' + task.status">{{statusLabel(task.status)}}</span></div>
+                <div class="reason-badges">
+                  @for (r of task.reasons; track r) { <span [class]="'badge reason-' + r">{{reasonLabel(r)}}</span> }
+                  @if (!task.reasons.length) { <span class="muted">Без формальных признаков проблемы</span> }
+                </div>
+                <div class="attention-facts"><span>{{userName(task.assignee_id)}}</span><span>Срок: {{task.due_at ? (task.due_at | date:'dd.MM.yyyy HH:mm':'UTC') + ' UTC' : 'не задан'}}</span></div>
+                @if (task.discussion_signal; as signal) {
+                  <div class="discussion-signal">
+                    <strong>{{signal.explicit ? 'Нужна помощь руководителя' : 'Возможная просьба · «' + signal.matched_phrase + '»'}}</strong>
+                    <div class="signal-author">{{signal.comment.author}} · {{signal.comment.created_at | date:'dd.MM.yyyy HH:mm':'UTC'}} UTC</div>
+                    <p>{{signal.comment.body}}</p>
+                    @if (!signal.explicit) { <small>Найдено по ключевой фразе. Проверьте актуальность и отметьте «Обработано» в карточке, если помощь уже не нужна.</small> }
+                    @else { <small>Автор явно запросил помощь. Руководитель может отметить просьбу обработанной в карточке.</small> }
+                    <small>Необработанных обращений в задаче: {{task.open_request_count}}</small>
+                  </div>
+                }
+                @if (task.last_comment; as c) {
+                  @if (c.id !== task.discussion_signal?.comment?.id) {
+                  <div class="comment-preview"><div><strong>{{c.author}}</strong><time>{{c.created_at | date:'dd.MM HH:mm':'UTC'}} UTC</time><span>Последний комментарий</span></div><p>{{c.body}}</p></div>
+                  }
+                } @else { <p class="no-discussion">Обсуждения пока нет.</p> }
+                <button class="open-discussion" (click)="openTask(task)">Разобраться · обсуждение ({{task.comment_count}}) →</button>
+              </article>
+            } @empty {
+              <div class="empty">
+                @if (attentionSearch() || reason()) { По заданным условиям задач нет. Сбросьте причину или измените поиск. }
+                @else if (scope() === 'attention') { По выбранным признакам нет задач, требующих внимания. Проверьте обсуждения в режиме «Все незавершённые». }
+                @else { В ваших активных проектах нет незавершённых задач. }
+              </div>
+            }
+          </div>
+        }
+      </section>
+      <p class="footnote">По ближайшему сроку независимо от причины; задачи без срока — в конце. Обзор обновляется вручную и после ваших изменений.</p>
+    } @else if (project(); as p) {
       <div class="breadcrumb">Проекты <span>/</span> {{p.archived ? 'Архив' : 'Рабочее пространство'}}</div>
       <div class="page-heading"><div><h1>{{p.name}}</h1><p>{{p.description}}</p></div>
         @if (!p.archived) { <button class="primary" (click)="createTask()" [disabled]="loading() || saving()">＋ Новая задача</button> }
@@ -45,25 +119,55 @@
     @else if (error()) { <button (click)="load()">Повторить загрузку</button> }
     @else { <div class="empty">У вас пока нет проектов.</div> }
   </main>
-  @if (detail() || creating()) {
+  @if (detail() || creating() || detailLoading()) {
     <aside class="detail" aria-label="Карточка задачи">
-      <div class="drawer-heading"><span>{{creating() ? 'Новая задача' : 'Задача #' + detail()?.id}}</span><button aria-label="Закрыть карточку" (click)="closeDetail()">✕</button></div>
+      <div class="drawer-heading"><span>{{detailLoading() ? 'Карточка задачи' : creating() ? 'Новая задача' : 'Задача #' + detail()?.id}}</span><button aria-label="Закрыть карточку" (click)="closeDetail()">✕</button></div>
+      <div #detailFeedback class="detail-feedback" tabindex="-1">
+        @if (error()) { <div role="alert" class="alert error">{{error()}}</div> }
+        @if (notice()) { <div role="status" class="alert success">{{notice()}}</div> }
+      </div>
+      @if (detailLoading()) { <div role="status" class="empty">Загружаем карточку…</div> }
+      @else {
+      <p class="detail-project">{{detailProject()?.name}}</p>
       <form (ngSubmit)="saveTask()">
-        <fieldset [disabled]="project()?.archived || saving()">
+        <fieldset [disabled]="detailProject()?.archived || saving()">
           <label>Название<input name="title" [(ngModel)]="draft.title" required maxlength="200"></label>
           <label>Описание<textarea name="description" [(ngModel)]="draft.description" rows="4" maxlength="5000"></textarea></label>
           <div class="form-row"><label>Статус<select name="status" aria-label="Статус" [(ngModel)]="draft.status">@for (s of statuses; track s.value) { <option [value]="s.value">{{s.label}}</option> }</select></label>
-          <label>Исполнитель<select name="assignee" aria-label="Исполнитель" [(ngModel)]="draft.assignee_id"><option [ngValue]="null">Не назначен</option>@for (u of project()?.members; track u.id) { <option [ngValue]="u.id">{{u.name}}</option> }</select></label></div>
+          <label>Исполнитель<select name="assignee" aria-label="Исполнитель" [(ngModel)]="draft.assignee_id"><option [ngValue]="null">Не назначен</option>@for (u of detailProject()?.members; track u.id) { <option [ngValue]="u.id">{{u.name}}</option> }</select></label></div>
           <label>Срок (UTC)<input type="datetime-local" name="due" [(ngModel)]="draft.due_at"></label>
-          @if (!project()?.archived) { <button type="submit" class="primary" [disabled]="!draft.title.trim()">{{saving() ? 'Сохраняем…' : 'Сохранить задачу'}}</button> }
+          @if (!detailProject()?.archived) { <button type="submit" class="primary" [disabled]="!draft.title.trim()">{{saving() ? 'Сохраняем…' : 'Сохранить задачу'}}</button> }
         </fieldset>
       </form>
       @if (detail(); as task) {
         <section class="comments"><h2>Обсуждение <span>{{task.comments.length}}</span></h2>
-          @for (c of task.comments; track c.id) { <article><strong>{{c.author}}</strong><time>{{c.created_at | date:'dd.MM.yyyy HH:mm':'UTC'}}</time><p>{{c.body}}</p></article> }
+          @for (c of task.comments; track c.id) {
+            <article [class.request-handled]="c.handled">
+              <strong>{{c.author}}</strong><time>{{c.created_at | date:'dd.MM.yyyy HH:mm':'UTC'}}</time><p>{{c.body}}</p>
+              @if (c.is_request) {
+                <div class="request-marker"><span [class]="'badge ' + (c.handled ? 'done' : c.help_requested ? 'reason-explicit' : 'reason-discussion')">{{c.handled ? 'Обработано' : c.help_requested ? 'Нужна помощь руководителя' : 'Возможная просьба'}}</span>
+                  @if (!c.help_requested) { <small>По фразе «{{c.matched_phrase}}» — проверьте контекст.</small> }
+                  @if (c.handled) { <small>{{c.handled_by_name}} · {{c.handled_at | date:'dd.MM.yyyy HH:mm':'UTC'}} UTC</small> }
+                  @if (task.status === 'done') { <small>Задача завершена и не входит в обзор. Возврат просьбы в обзор требует переоткрытия задачи.</small> }
+                  @if (!detailProject()?.archived && detailProject()?.owner_id === api.userId) {
+                    <button type="button" (click)="setRequestHandled(c, !c.handled)" [disabled]="saving()">{{c.handled ? (task.status === 'done' ? 'Снять отметку обработки' : 'Вернуть в обзор') : 'Отметить обработанной'}}</button>
+                  }
+                </div>
+              }
+            </article>
+          }
           @empty { <p class="muted">Комментариев пока нет.</p> }
-          @if (!project()?.archived) { <form (ngSubmit)="addComment()"><label>Комментарий<textarea name="comment" [(ngModel)]="comment" rows="3" required maxlength="2000" [disabled]="saving()"></textarea></label><button type="submit" [disabled]="!comment.trim() || saving()">Добавить комментарий</button></form> }
+          @if (!detailProject()?.archived) {
+            <form (ngSubmit)="addComment()">
+              <label>Комментарий<textarea name="comment" [(ngModel)]="comment" rows="3" required maxlength="2000" [disabled]="saving()"></textarea></label>
+              <label class="help-request-toggle"><input type="checkbox" name="helpRequested" [(ngModel)]="helpRequested" [disabled]="saving() || task.status === 'done'">Нужна помощь руководителя</label>
+              @if (task.status === 'done') { <p class="request-hint">Задача завершена. Обычный комментарий можно отправить; для запроса помощи сначала переоткройте задачу.</p> }
+              @else { <p class="request-hint">Отметьте, если ожидаете вмешательства руководителя. Комментарий появится в его обзоре.</p> }
+              <button type="submit" [disabled]="!comment.trim() || saving()">Добавить комментарий</button>
+            </form>
+          }
         </section>
+      }
       }
     </aside>
   }
