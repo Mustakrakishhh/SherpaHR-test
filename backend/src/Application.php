@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/Attention.php';
+
 final class ApiError extends RuntimeException {}
 
 final class Application
@@ -40,6 +42,10 @@ final class Application
 
     private function dispatch(string $method, string $path): void
     {
+        if ($method === 'GET' && $path === '/api/attention') {
+            $this->respond((new Attention($this->db))->forUser($this->userId, new DateTimeImmutable('now', new DateTimeZone('UTC'))));
+            return;
+        }
         if ($method === 'GET' && $path === '/api/context') {
             $this->respond([
                 'user' => $this->one('SELECT * FROM users WHERE id = ?', [$this->userId]),
@@ -61,7 +67,7 @@ final class Application
         if (preg_match('#^/api/projects/(\d+)/tasks$#', $path, $match)) {
             $project = $this->project((int) $match[1]);
             if ($method === 'GET') {
-                $this->respond($this->all('SELECT t.* FROM tasks t JOIN users u ON u.id=t.assignee_id WHERE t.project_id=? ORDER BY t.id', [$project['id']]));
+                $this->respond($this->all('SELECT t.* FROM tasks t WHERE t.project_id=? ORDER BY t.id', [$project['id']]));
                 return;
             }
             if ($method === 'POST') {
@@ -77,7 +83,7 @@ final class Application
         if (preg_match('#^/api/tasks/(\d+)$#', $path, $match)) {
             $task = $this->task((int) $match[1]);
             if ($method === 'GET') {
-                $task['comments'] = $this->all('SELECT c.*, u.name AS author FROM comments c JOIN users u ON u.id=c.user_id WHERE task_id=? ORDER BY c.id', [$task['id']]);
+                $task['comments'] = array_map([Attention::class, 'comment'], $this->all('SELECT c.*, u.name AS author, handler.name AS handled_by_name FROM comments c JOIN users u ON u.id=c.user_id LEFT JOIN users handler ON handler.id=c.handled_by WHERE task_id=? ORDER BY c.id', [$task['id']]));
                 $this->respond($task);
                 return;
             }
@@ -98,12 +104,53 @@ final class Application
                 return;
             }
         }
+        if ($method === 'PATCH' && preg_match('#^/api/tasks/(\d+)/comments/(\d+)/attention$#', $path, $match)) {
+            $task = $this->task((int) $match[1]);
+            $project = $this->project($task['project_id']);
+            $this->writable($project);
+            $comment = $this->comment($task['id'], (int) $match[2]);
+            if ($project['owner_id'] !== $this->userId) {
+                throw new ApiError('Обработать просьбу может только руководитель проекта', 403);
+            }
+            $data = $this->input();
+            if (array_diff(array_keys($data), ['handled', 'version'])
+                || !isset($data['handled'], $data['version']) || !is_bool($data['handled'])
+                || !is_int($data['version']) || $data['version'] < 0) {
+                throw new ApiError('Нужны handled (boolean) и version (целое число от 0)', 422);
+            }
+            if (!$comment['is_request']) {
+                throw new ApiError('В комментарии нет просьбы о помощи', 422);
+            }
+            // Compare-and-swap prevents a stale tab from hiding a request reopened elsewhere.
+            $stmt = $this->db->prepare('UPDATE comments SET handled_at=?,handled_by=?,attention_version=attention_version+1 WHERE id=? AND attention_version=?');
+            $stmt->execute([
+                $data['handled'] ? gmdate('Y-m-d\TH:i:s\Z') : null,
+                $data['handled'] ? $this->userId : null, $comment['id'], $data['version'],
+            ]);
+            if ($stmt->rowCount() !== 1) {
+                throw new ApiError('Отметка просьбы изменилась. Откройте задачу заново.', 409);
+            }
+            $this->respond($this->comment($task['id'], $comment['id']));
+            return;
+        }
         if ($method === 'POST' && preg_match('#^/api/tasks/(\d+)/comments$#', $path, $match)) {
             $task = $this->task((int) $match[1]);
             $this->writable($this->project($task['project_id']));
             $data = $this->input();
-            $this->text($data['body'] ?? null, 'Комментарий', 5000, true);
-            throw new ApiError('Добавление комментариев пока не реализовано', 501);
+            if (array_diff(array_keys($data), ['body', 'help_requested'])) {
+                throw new ApiError('Неизвестные поля комментария', 422);
+            }
+            $body = $this->text($data['body'] ?? null, 'Комментарий', 5000, true);
+            if (array_key_exists('help_requested', $data) && !is_bool($data['help_requested'])) {
+                throw new ApiError('help_requested должен быть boolean', 422);
+            }
+            if (($data['help_requested'] ?? false) && $task['status'] === 'done') {
+                throw new ApiError('Задача завершена. Чтобы запросить помощь, сначала переоткройте её.', 409);
+            }
+            $stmt = $this->db->prepare('INSERT INTO comments (task_id,user_id,body,created_at,help_requested) VALUES (?,?,?,?,?)');
+            $stmt->execute([$task['id'], $this->userId, $body, gmdate('Y-m-d\TH:i:s\Z'), (int) ($data['help_requested'] ?? false)]);
+            $this->respond($this->comment($task['id'], (int) $this->db->lastInsertId()), 201);
+            return;
         }
         throw new ApiError('Маршрут не найден', 404);
     }
@@ -149,6 +196,13 @@ final class Application
             $out['due_at'] = $due;
         }
         return $out;
+    }
+
+    private function comment(int $taskId, int $commentId): array
+    {
+        $comment = $this->one('SELECT c.*, u.name AS author, handler.name AS handled_by_name FROM comments c JOIN users u ON u.id=c.user_id LEFT JOIN users handler ON handler.id=c.handled_by WHERE c.id=? AND c.task_id=?', [$commentId, $taskId]);
+        if (!$comment) throw new ApiError('Комментарий не найден', 404);
+        return Attention::comment($comment);
     }
 
     private function text(mixed $value, string $name, int $max, bool $required): string
